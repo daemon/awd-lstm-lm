@@ -128,6 +128,7 @@ class SplitCrossEntropyLoss(nn.Module):
         # We need to guard against empty splits as torch.cat does not like random lists
         combo = torch.cat([split_hiddens[i] for i in range(self.nsplits) if len(split_hiddens[i])])
         ###
+        # print(combo.size(), head_weight.size(), head_bias.size())
         all_head_res = torch.nn.functional.linear(combo, head_weight, bias=head_bias)
         softmaxed_all_head_res = torch.nn.functional.log_softmax(all_head_res)
         if self.verbose or verbose:

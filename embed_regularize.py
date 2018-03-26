@@ -1,7 +1,10 @@
 import numpy as np
 
 import torch
+import torch.nn.functional as F
 from torch.autograd import Variable
+
+_embed_fn = torch.nn.backends.thnn.backend.Embedding.apply if float(torch.__version__[:3]) <= 0.35 else F.embedding
 
 def embedded_dropout(embed, words, dropout=0.1, scale=None):
   if dropout:
@@ -16,9 +19,9 @@ def embedded_dropout(embed, words, dropout=0.1, scale=None):
   padding_idx = embed.padding_idx
   if padding_idx is None:
       padding_idx = -1
-  X = embed._backend.Embedding.apply(words, masked_embed_weight,
-    padding_idx, embed.max_norm, embed.norm_type,
-    embed.scale_grad_by_freq, embed.sparse
+
+  X = _embed_fn(words, masked_embed_weight,
+    padding_idx, embed.max_norm, embed.norm_type
   )
   return X
 

@@ -83,12 +83,13 @@ if torch.cuda.is_available():
 
 def model_save(fn):
     with open(fn, 'wb') as f:
-        torch.save([model, criterion, optimizer], f)
+        torch.save([model.state_dict(), criterion, optimizer], f)
 
 def model_load(fn):
     global model, criterion, optimizer
     with open(fn, 'rb') as f:
-        model, criterion, optimizer = torch.load(f)
+        model_dict, criterion, optimizer = torch.load(f)
+    model.load_state_dict(model_dict, strict=False)
 
 import os
 import hashlib
@@ -189,6 +190,7 @@ def train():
         optimizer.param_groups[0]['lr'] = lr2 * seq_len / args.bptt
         model.train()
         data, targets = get_batch(train_data, i, args, seq_len=seq_len)
+        
 
         # Starting each batch, we detach the hidden state from how it was previously produced.
         # If we didn't, the model would try backpropagating all the way to start of the dataset.
