@@ -6,16 +6,28 @@ from embed_regularize import embedded_dropout
 from locked_dropout import LockedDropout
 from weight_drop import WeightDrop
 
+import candle
+
 class RNNModel(nn.Module):
     """Container module with an encoder, a recurrent module, and a decoder."""
 
-    def __init__(self, rnn_type, ntoken, ninp, nhid, nlayers, dropout=0.5, dropouth=0.5, dropouti=0.5, dropoute=0.1, wdrop=0, tie_weights=False):
+    def __init__(self, rnn_type, ntoken, ninp, nhid, nlayers, dropout=0.5, dropouth=0.5, dropouti=0.5, dropoute=0.1, wdrop=0, 
+            tie_weights=False, binarized=False, collect_stats=False):
         super(RNNModel, self).__init__()
+        self.binarized = binarized
+        self.collect_stats = collect_stats
         self.lockdrop = LockedDropout()
         self.idrop = nn.Dropout(dropouti)
         self.hdrop = nn.Dropout(dropouth)
         self.drop = nn.Dropout(dropout)
-        self.encoder = nn.Embedding(ntoken, ninp)
+        self.ctx = ctx = candle.StepQuantizeContext(soft=False)
+        self.scale = nn.Parameter(torch.Tensor([0]))
+        self.bin_tanh = ctx.activation(soft=False)
+        self.encoder = ctx.bypass(nn.Embedding(ntoken, ninp))
+        if binarized:
+            self.decode_bn = ctx.bypass(nn.BatchNorm1d(nhid))
+        elif collect_stats:
+            self.encode_bn = ctx.moment_stat(name="encoder")
         assert rnn_type in ['LSTM', 'QRNN', 'GRU'], 'RNN type is not supported'
         if rnn_type == 'LSTM':
             self.rnns = [torch.nn.LSTM(ninp if l == 0 else nhid, nhid if l != nlayers - 1 else (ninp if tie_weights else nhid), 1, dropout=0) for l in range(nlayers)]
@@ -27,12 +39,20 @@ class RNNModel(nn.Module):
                 self.rnns = [WeightDrop(rnn, ['weight_hh_l0'], dropout=wdrop) for rnn in self.rnns]
         elif rnn_type == 'QRNN':
             from torchqrnn import QRNNLayer
-            self.rnns = [QRNNLayer(input_size=ninp if l == 0 else nhid, hidden_size=nhid if l != nlayers - 1 else (ninp if tie_weights else nhid), save_prev_x=True, zoneout=0, window=2 if l == 0 else 1, output_gate=True) for l in range(nlayers)]
+            self.rnns = [QRNNLayer(input_size=ninp if l == 0 else nhid, hidden_size=nhid if l != nlayers - 1 else (ninp if tie_weights else nhid), save_prev_x=True, 
+                    zoneout=0, window=2 if l == 0 else 1, output_gate=True, binarized=binarized, ctx=ctx, 
+                    collect_stats=collect_stats, scale=self.scale) for l in range(nlayers)]
             for rnn in self.rnns:
-                rnn.linear = WeightDrop(rnn.linear, ['weight'], dropout=wdrop)
+                if binarized:
+                    pass
+                    # rnn.linear.hook_weight(candle.WeightDrop, p=wdrop)
+                    # rnn.linear.hook_weight(candle.SignFlip, p=wdrop)
+                else:
+                    rnn.linear = WeightDrop(rnn.linear, ['weight'], dropout=wdrop)
         print(self.rnns)
         self.rnns = torch.nn.ModuleList(self.rnns)
-        self.decoder = nn.Linear(nhid, ntoken)
+        # self.decoder = ctx.wrap(nn.Linear(nhid, ntoken), soft=True, scale=self.scale) if binarized else ctx.bypass(nn.Linear(nhid, ntoken))
+        self.decoder = ctx.bypass(nn.Linear(nhid, ntoken))
 
         # Optionally tie weights as in:
         # "Using the Output Embedding to Improve Language Models" (Press & Wolf 2016)
@@ -43,7 +63,12 @@ class RNNModel(nn.Module):
         if tie_weights:
             #if nhid != ninp:
             #    raise ValueError('When using the tied flag, nhid must be equal to emsize')
-            self.decoder.weight = self.encoder.weight
+            if binarized:
+                pass
+                # self.decoder.weight = self.encoder.weight
+                # self.decoder.tie_weight(self.encoder.weight)
+            else:
+                self.decoder.weight = self.encoder.weight
 
         self.init_weights()
 
@@ -62,15 +87,19 @@ class RNNModel(nn.Module):
 
     def init_weights(self):
         initrange = 0.1
-        self.encoder.weight.data.uniform_(-initrange, initrange)
-        self.decoder.bias.data.fill_(0)
-        self.decoder.weight.data.uniform_(-initrange, initrange)
+        if not self.binarized:
+            self.encoder.weight.data.uniform_(-initrange, initrange)
+            self.decoder.bias.data.fill_(0)
+            self.decoder.weight.data.uniform_(-initrange, initrange)
 
     def forward(self, input, hidden, return_h=False):
         emb = embedded_dropout(self.encoder, input, dropout=self.dropoute if self.training else 0)
+        if self.binarized:
+            emb = self.bin_tanh(emb)
         #emb = self.idrop(emb)
 
-        emb = self.lockdrop(emb, self.dropouti)
+        if not self.binarized:
+            emb = self.lockdrop(emb, self.dropouti)
 
         raw_output = emb
         new_hidden = []
@@ -80,21 +109,30 @@ class RNNModel(nn.Module):
         for l, rnn in enumerate(self.rnns):
             current_input = raw_output
             raw_output, new_h = rnn(raw_output, hidden[l])
+            if self.binarized:
+                raw_output = self.bin_tanh(raw_output)
             new_hidden.append(new_h)
             raw_outputs.append(raw_output)
             if l != self.nlayers - 1:
                 #self.hdrop(raw_output)
-                raw_output = self.lockdrop(raw_output, self.dropouth)
+                if not self.binarized:
+                    raw_output = self.lockdrop(raw_output, self.dropouth)
                 outputs.append(raw_output)
         hidden = new_hidden
 
-        output = self.lockdrop(raw_output, self.dropout)
+        if not self.binarized:
+            output = self.lockdrop(raw_output, self.dropout)
+        else:
+            output = raw_output
         outputs.append(output)
 
         result = output.view(output.size(0)*output.size(1), output.size(2))
+        if self.binarized:
+            result = self.decode_bn(result)
+        result = self.decoder(result)
         if return_h:
             return result, hidden, raw_outputs, outputs
-        return result, hidden
+        return result.view(output.size(0), output.size(1), result.size(1)), hidden
 
     def init_hidden(self, bsz):
         weight = next(self.parameters()).data
