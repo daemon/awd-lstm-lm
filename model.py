@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 from torch.autograd import Variable
@@ -20,12 +22,13 @@ class RNNModel(nn.Module):
         self.idrop = nn.Dropout(dropouti)
         self.hdrop = nn.Dropout(dropouth)
         self.drop = nn.Dropout(dropout)
-        self.ctx = ctx = candle.StepQuantizeContext(soft=False)
+        self.ctx = ctx = candle.TernaryQuantizeContext()
         self.scale = nn.Parameter(torch.Tensor([0]))
-        self.bin_tanh = ctx.activation(soft=False)
+        # self.ternary = ctx.activation(k=8)
         self.encoder = ctx.bypass(nn.Embedding(ntoken, ninp))
+        self.md = candle.LinearMarkovDropout(0.7, min_length=0.5, size=ninp)
         if binarized:
-            self.decode_bn = ctx.bypass(nn.BatchNorm1d(nhid))
+            self.decode_bn = ctx.bypass(nn.BatchNorm1d(ninp))
         elif collect_stats:
             self.encode_bn = ctx.moment_stat(name="encoder")
         assert rnn_type in ['LSTM', 'QRNN', 'GRU'], 'RNN type is not supported'
@@ -44,12 +47,11 @@ class RNNModel(nn.Module):
                     collect_stats=collect_stats, scale=self.scale) for l in range(nlayers)]
             for rnn in self.rnns:
                 if binarized:
-                    pass
-                    # rnn.linear.hook_weight(candle.WeightDrop, p=wdrop)
+                    rnn.linear.hook_weight(candle.WeightDrop, p=wdrop)
                     # rnn.linear.hook_weight(candle.SignFlip, p=wdrop)
                 else:
                     rnn.linear = WeightDrop(rnn.linear, ['weight'], dropout=wdrop)
-        print(self.rnns)
+        # print(self.rnns)
         self.rnns = torch.nn.ModuleList(self.rnns)
         # self.decoder = ctx.wrap(nn.Linear(nhid, ntoken), soft=True, scale=self.scale) if binarized else ctx.bypass(nn.Linear(nhid, ntoken))
         self.decoder = ctx.bypass(nn.Linear(nhid, ntoken))
@@ -65,7 +67,7 @@ class RNNModel(nn.Module):
             #    raise ValueError('When using the tied flag, nhid must be equal to emsize')
             if binarized:
                 pass
-                # self.decoder.weight = self.encoder.weight
+                self.decoder.weight = self.encoder.weight
                 # self.decoder.tie_weight(self.encoder.weight)
             else:
                 self.decoder.weight = self.encoder.weight
@@ -82,6 +84,10 @@ class RNNModel(nn.Module):
         self.dropoute = dropoute
         self.tie_weights = tie_weights
 
+    def norm_prune(self, pct=0.4):
+        for rnn in self.rnns:
+            candle.prune_qrnn(rnn.linear, 1 - math.sqrt(1 - pct))
+
     def reset(self):
         if self.rnn_type == 'QRNN': [r.reset() for r in self.rnns]
 
@@ -94,12 +100,12 @@ class RNNModel(nn.Module):
 
     def forward(self, input, hidden, return_h=False):
         emb = embedded_dropout(self.encoder, input, dropout=self.dropoute if self.training else 0)
-        if self.binarized:
-            emb = self.bin_tanh(emb)
+        # if self.binarized:
+        #     emb = self.ternary(emb)
         #emb = self.idrop(emb)
 
-        if not self.binarized:
-            emb = self.lockdrop(emb, self.dropouti)
+        emb = self.lockdrop(emb, self.dropouti) # disabled because of Markov dropout
+        # emb = self.md(emb.permute(1, 2, 0)).permute(2, 0, 1)
 
         raw_output = emb
         new_hidden = []
@@ -109,26 +115,22 @@ class RNNModel(nn.Module):
         for l, rnn in enumerate(self.rnns):
             current_input = raw_output
             raw_output, new_h = rnn(raw_output, hidden[l])
-            if self.binarized:
-                raw_output = self.bin_tanh(raw_output)
+            # if self.binarized:
+            #     raw_output = self.ternary(raw_output)
             new_hidden.append(new_h)
             raw_outputs.append(raw_output)
             if l != self.nlayers - 1:
                 #self.hdrop(raw_output)
-                if not self.binarized:
-                    raw_output = self.lockdrop(raw_output, self.dropouth)
+                raw_output = self.lockdrop(raw_output, self.dropouth) # disabled because of Markov dropout
                 outputs.append(raw_output)
         hidden = new_hidden
 
-        if not self.binarized:
-            output = self.lockdrop(raw_output, self.dropout)
-        else:
-            output = raw_output
+        output = self.lockdrop(raw_output, self.dropout) # disabled because of Markov dropout
         outputs.append(output)
 
         result = output.view(output.size(0)*output.size(1), output.size(2))
-        if self.binarized:
-            result = self.decode_bn(result)
+        # if self.binarized:
+        #     result = self.decode_bn(result)
         result = self.decoder(result)
         if return_h:
             return result, hidden, raw_outputs, outputs

@@ -136,6 +136,7 @@ if args.resume:
     #         if type(rnn) == WeightDrop: rnn.dropout = args.wdrop
     #         elif rnn.zoneout > 0: rnn.zoneout = args.wdrop
 ###
+
 if not criterion:
     splits = []
     if ntokens > 500000:
@@ -270,13 +271,13 @@ try:
         optimizer = candle.SGD(params, lr=args.lr, sign=True, weight_decay=args.wdecay)
     elif args.optimizer == 'asgd':
         optimizer = torch.optim.ASGD(params, lr=args.lr, t0=0, lambd=0., weight_decay=args.wdecay)
-    scheduler = ExponentialLR(optimizer, 0.96)
+    scheduler = ExponentialLR(optimizer, 0.98)
     for epoch in range(1, args.epochs+1):
         epoch_start_time = time.time()
         if args.collect_stats:
             print("Collecting moment statistics...")
         train()
-        if epoch < 100 and args.binarized:
+        if epoch < 300 and args.binarized and args.optimizer == "adam":
             scheduler.step()
         # torch.save([model.rnns[2].m_track[i].mean for i in range(30)], "means")
         # torch.save([model.rnns[2].m_track[i].variance for i in range(30)], "vars")
@@ -341,6 +342,7 @@ except KeyboardInterrupt:
 
 # Load the best saved model.
 model_load(args.save)
+model.norm_prune()
 
 # Run on test data.
 test_loss = evaluate(test_data, test_batch_size)
