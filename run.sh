@@ -1,0 +1,3 @@
+#!/bin/sh
+# CUDA_VISIBLE_DEVICES=0 python -u main.py --model QRNN --batch_size 20 --clip 0.2 --wdrop 0.1 --nhid 1550 --nlayers 4 --emsize 400 --dropouth 0.3 --seed 9001 --dropouti 0.4 --epochs 550 --binarized --scale_alpha 1 --nonmono 20 --save PTB.pt --log-interval 200 --optimizer adam --lr 4E-3
+CUDA_VISIBLE_DEVICES=0 python -u main.py --model QRNN --batch_size 20 --clip 0.2 --wdrop 0.1 --nhid 1550 --nlayers 4 --emsize 400 --dropouth 0.3 --seed 9001 --dropouti 0.4 --epochs 550 --binarized --scale_alpha 1 --nonmono 5 --save PTB.pt --log-interval 100 --resume PTB.pt
