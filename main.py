@@ -18,7 +18,7 @@ parser = argparse.ArgumentParser(description='PyTorch PennTreeBank RNN/LSTM Lang
 parser.add_argument('--data', type=str, default='data/penn/',
                     help='location of the data corpus')
 parser.add_argument('--model', type=str, default='LSTM',
-                    help='type of recurrent net (LSTM, QRNN, GRU)')
+                    help='type of recurrent net (LSTM, LSTM-MD, QRNN, GRU)')
 parser.add_argument('--emsize', type=int, default=400,
                     help='size of word embeddings')
 parser.add_argument('--nhid', type=int, default=1150,
@@ -51,6 +51,7 @@ parser.add_argument('--nonmono', type=int, default=5,
                     help='monotocity threshold')
 parser.add_argument('--cuda', action='store_false',
                     help='use CUDA')
+parser.add_argument('--no_md', action='store_true')
 parser.add_argument('--log-interval', type=int, default=200, metavar='N',
                     help='report interval')
 randomhash = ''.join(str(time.time()).split('.'))
@@ -69,8 +70,14 @@ parser.add_argument('--optimizer', type=str,  default='sgd',
 parser.add_argument('--when', nargs="+", type=int, default=[-1],
                     help='When (which epochs) to divide the learning rate by 10 - accepts multiple')
 parser.add_argument('--binarized', default=False, action='store_true')
+parser.add_argument('--test', default=False, action='store_true')
+parser.add_argument('--keep_pct_test', default=1, type=float)
 parser.add_argument('--collect_stats', default=False, action='store_true')
+parser.add_argument('--refresh_opt', default=False, action='store_true')
+parser.add_argument('--split_cross', default=False, action='store_true')
 parser.add_argument('--scale_alpha', default=1E-5, type=float)
+parser.add_argument('--keep_pct', default=1, type=float)
+parser.add_argument('--log_out', default="out", type=str)
 args = parser.parse_args()
 args.tied = True
 
@@ -78,6 +85,7 @@ args.tied = True
 np.random.seed(args.seed)
 torch.manual_seed(args.seed)
 if torch.cuda.is_available():
+    # torch.backends.cudnn.benchmark = True
     if not args.cuda:
         print("WARNING: You have a CUDA device, so you should probably run with --cuda")
     else:
@@ -123,11 +131,14 @@ criterion = None
 
 ntokens = len(corpus.dictionary)
 model = model.RNNModel(args.model, ntokens, args.emsize, args.nhid, args.nlayers, args.dropout, 
-    args.dropouth, args.dropouti, args.dropoute, args.wdrop, args.tied, binarized=args.binarized, collect_stats=args.collect_stats)
+    args.dropouth, args.dropouti, args.dropoute, args.wdrop, args.tied,
+    binarized=args.binarized, collect_stats=args.collect_stats, no_md=args.no_md, split_cross=args.split_cross)
 ###
 if args.resume:
     print('Resuming model ...')
     model_load(args.resume)
+    if args.keep_pct != 1:
+        model.linear_prune(args.keep_pct)
     optimizer.param_groups[0]['lr'] = args.lr
     model.dropouti, model.dropouth, model.dropout, args.dropoute = args.dropouti, args.dropouth, args.dropout, args.dropoute
     # if args.wdrop:
@@ -148,12 +159,20 @@ if not criterion:
         # WikiText-103
         splits = [2800, 20000, 76000]
     print('Using', splits)
-    criterion = nn.CrossEntropyLoss() # SplitCrossEntropyLoss(args.emsize, splits=splits, verbose=False)
+    if args.split_cross:
+        criterion = SplitCrossEntropyLoss(args.emsize, splits=splits, verbose=False)
+    else:
+        criterion = nn.CrossEntropyLoss() # SplitCrossEntropyLoss(args.emsize, splits=splits, verbose=False)
 ###
 params = list(filter(lambda p: not p is model.scale, model.parameters()))
 params = list(params)# + list(criterion.parameters())
+if args.split_cross:
+    params = params + list(criterion.parameters())
+print(args.split_cross)
 if args.cuda:
     model = model.cuda()
+    if args.split_cross:
+        criterion = criterion.cuda()
     # criterion = criterion.cuda()
     params = list(params)# + list(criterion.parameters())
 ###
@@ -191,7 +210,10 @@ def evaluate(data_source, batch_size=10):
         data, targets = get_batch(data_source, i, args, evaluation=True)
         output, hidden = model(data, hidden)
         output_flat = output.view(-1, ntokens)
-        total_loss += len(data) * criterion(output_flat, targets).data
+        if args.split_cross:
+            total_loss += len(data) * criterion(model.decoder, output, targets).data
+        else:
+            total_loss += len(data) * criterion(output_flat, targets).data
         hidden = repackage_hidden(hidden)
     return total_loss[0] / len(data_source)
 
@@ -224,7 +246,10 @@ def train():
 
         output, hidden, rnn_hs, dropped_rnn_hs = model(data, hidden, return_h=True)
 
-        raw_loss = criterion(output, targets)
+        if args.split_cross:
+            raw_loss = criterion(model.decoder, output, targets)
+        else:
+            raw_loss = criterion(output, targets)
 
         loss = raw_loss
         # Activiation Regularization
@@ -245,10 +270,13 @@ def train():
         if batch % args.log_interval == 0 and batch > 0:
             cur_loss = total_loss[0] / args.log_interval
             elapsed = time.time() - start_time
-            print('| epoch {:3d} | {:5d}/{:5d} batches | lr {:05.5f} | ms/batch {:5.2f} | '
-                    'loss {:5.2f} | ppl {:8.2f} | bpc {:8.3f} | scale {:.3}'.format(
+            out = ('| epoch {:3d} | {:5d}/{:5d} batches | lr {:05.5f} | ms/batch {:5.2f} | ' +\
+                    'loss {:5.2f} | ppl {:8.2f} | bpc {:8.3f} | scale {:.3}').format(
                 epoch, batch, len(train_data) // args.bptt, optimizer.param_groups[0]['lr'],
-                elapsed * 1000 / args.log_interval, cur_loss, math.exp(cur_loss), cur_loss / math.log(2), model.scale.data.item()))
+                elapsed * 1000 / args.log_interval, cur_loss, math.exp(cur_loss), cur_loss / math.log(2), model.scale.data.item())
+            print(out)
+            with open(args.log_out, "a") as f:
+                f.write(out + "\n")
             total_loss = 0
             start_time = time.time()
         ###
@@ -262,23 +290,23 @@ stored_loss = 100000000
 
 # At any point you can hit Ctrl + C to break out of training early.
 try:
-    optimizer = None
-    if args.optimizer == 'sgd':
-        optimizer = torch.optim.SGD(params, lr=args.lr, weight_decay=args.wdecay)
-    elif args.optimizer == 'adam':
-        optimizer = torch.optim.Adam(params, lr=args.lr, weight_decay=args.wdecay)
-    elif args.optimizer == 'signsgd':
-        optimizer = candle.SGD(params, lr=args.lr, sign=True, weight_decay=args.wdecay)
-    elif args.optimizer == 'asgd':
-        optimizer = torch.optim.ASGD(params, lr=args.lr, t0=0, lambd=0., weight_decay=args.wdecay)
-    scheduler = ExponentialLR(optimizer, 0.98)
+    if not args.resume or args.refresh_opt:
+        optimizer = None
+        if args.optimizer == 'sgd':
+            optimizer = torch.optim.SGD(params, lr=args.lr, weight_decay=args.wdecay)
+        elif args.optimizer == 'adam':
+            optimizer = torch.optim.Adam(params, lr=args.lr, weight_decay=args.wdecay)
+        elif args.optimizer == 'signsgd':
+            optimizer = candle.SGD(params, lr=args.lr, sign=True, weight_decay=args.wdecay)
+        elif args.optimizer == 'asgd':
+            optimizer = torch.optim.ASGD(params, lr=args.lr, t0=0, lambd=0., weight_decay=args.wdecay)
     for epoch in range(1, args.epochs+1):
+        if args.test:
+            raise KeyboardInterrupt
         epoch_start_time = time.time()
         if args.collect_stats:
             print("Collecting moment statistics...")
         train()
-        if epoch < 300 and args.binarized and args.optimizer == "adam":
-            scheduler.step()
         # torch.save([model.rnns[2].m_track[i].mean for i in range(30)], "means")
         # torch.save([model.rnns[2].m_track[i].variance for i in range(30)], "vars")
         # TODO: reset mtracks here
@@ -295,10 +323,18 @@ try:
 
             val_loss2 = evaluate(val_data)
             print('-' * 89)
-            print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
-                'valid ppl {:8.2f} | valid bpc {:8.3f}'.format(
-              epoch, (time.time() - epoch_start_time), val_loss2, math.exp(val_loss2), val_loss2 / math.log(2)))
+            out = ('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | ' +\
+                'valid ppl {:8.2f} | valid bpc {:8.3f}').format(
+              epoch, (time.time() - epoch_start_time), val_loss2, math.exp(val_loss2), val_loss2 / math.log(2))
+            print(out)
             print('-' * 89)
+            with open(args.log_out, "a") as f:
+                f.write("-" * 89)
+                f.write("\n")
+                f.write(out)
+                f.write("\n")
+                f.write("-" * 89)
+                f.write("\n")
 
             if val_loss2 < stored_loss:
                 model_save(args.save)
@@ -313,11 +349,19 @@ try:
 
         else:
             val_loss = evaluate(val_data, eval_batch_size)
+            out = '| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | valid ppl {:8.2f} | valid bpc {:8.3f}'.format(
+              epoch, (time.time() - epoch_start_time), val_loss, math.exp(val_loss), val_loss / math.log(2))
             print('-' * 89)
-            print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
-                'valid ppl {:8.2f} | valid bpc {:8.3f}'.format(
-              epoch, (time.time() - epoch_start_time), val_loss, math.exp(val_loss), val_loss / math.log(2)))
+            print(out)
             print('-' * 89)
+
+            with open(args.log_out, "a") as f:
+                f.write("-" * 89)
+                f.write("\n")
+                f.write(out)
+                f.write("\n")
+                f.write("-" * 89)
+                f.write("\n")
 
             if val_loss < stored_loss:
                 model_save(args.save)
@@ -342,11 +386,20 @@ except KeyboardInterrupt:
 
 # Load the best saved model.
 model_load(args.save)
-model.norm_prune()
+keep_pct = args.keep_pct_test
+# model.norm_prune(1 - keep_pct)
+model.linear_prune(keep_pct)
+# model.linear_prune_lstm(keep_pct)
+# model.norm_prune_lstm(1 - keep_pct)
 
+import time
 # Run on test data.
+a = time.time()
 test_loss = evaluate(test_data, test_batch_size)
+b = time.time()
 print('=' * 89)
 print('| End of training | test loss {:5.2f} | test ppl {:8.2f} | test bpc {:8.3f}'.format(
     test_loss, math.exp(test_loss), test_loss / math.log(2)))
 print('=' * 89)
+
+print(f"Time taken: {b - a:.4} seconds, FLOPs: {keep_pct * 100}%")

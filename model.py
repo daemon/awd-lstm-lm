@@ -14,7 +14,7 @@ class RNNModel(nn.Module):
     """Container module with an encoder, a recurrent module, and a decoder."""
 
     def __init__(self, rnn_type, ntoken, ninp, nhid, nlayers, dropout=0.5, dropouth=0.5, dropouti=0.5, dropoute=0.1, wdrop=0, 
-            tie_weights=False, binarized=False, collect_stats=False):
+            tie_weights=False, binarized=False, collect_stats=False, no_md=False, split_cross=False):
         super(RNNModel, self).__init__()
         self.binarized = binarized
         self.collect_stats = collect_stats
@@ -24,18 +24,30 @@ class RNNModel(nn.Module):
         self.drop = nn.Dropout(dropout)
         self.ctx = ctx = candle.TernaryQuantizeContext()
         self.scale = nn.Parameter(torch.Tensor([0]))
+        self.nout = ninp
+        self.no_md = no_md
+        self.se = split_cross
         # self.ternary = ctx.activation(k=8)
         self.encoder = ctx.bypass(nn.Embedding(ntoken, ninp))
-        self.md = candle.LinearMarkovDropout(0.7, min_length=0.5, size=ninp)
+        # self.mdC = []
+        # self.mdH = []
+        # for _ in range(nlayers):
+        #     td = candle.UniformTiedGenerator()
+        #     self.mdC.append(candle.LinearMarkovDropout(0.6, min_length=0.4, tied_generator=td, tied_root=True, tied=True, rescale=False))
+        #     self.mdH.append(candle.LinearMarkovDropout(0.6, min_length=0.4, tied_generator=td, tied=True, rescale=False))
         if binarized:
             self.decode_bn = ctx.bypass(nn.BatchNorm1d(ninp))
         elif collect_stats:
             self.encode_bn = ctx.moment_stat(name="encoder")
-        assert rnn_type in ['LSTM', 'QRNN', 'GRU'], 'RNN type is not supported'
+        assert rnn_type in ['LSTM', 'QRNN', 'GRU', 'LSTM-MD'], 'RNN type is not supported'
         if rnn_type == 'LSTM':
             self.rnns = [torch.nn.LSTM(ninp if l == 0 else nhid, nhid if l != nlayers - 1 else (ninp if tie_weights else nhid), 1, dropout=0) for l in range(nlayers)]
             if wdrop:
                 self.rnns = [WeightDrop(rnn, ['weight_hh_l0'], dropout=wdrop) for rnn in self.rnns]
+        elif rnn_type == 'LSTM-MD':
+            self.rnns = [torch.nn.LSTM(ninp if l == 0 else nhid, nhid if l != nlayers - 1 else (ninp if tie_weights else nhid), 1, dropout=0) for l in range(nlayers)]
+            if wdrop:
+                self.rnns = [WeightDrop(rnn, ['weight_hh_l0'], ['weight_hh_l0', 'weight_ih_l0', 'bias_hh_l0', 'bias_ih_l0'], dropout=wdrop, md=(0.6, 0.4)) for rnn in self.rnns]
         if rnn_type == 'GRU':
             self.rnns = [torch.nn.GRU(ninp if l == 0 else nhid, nhid if l != nlayers - 1 else ninp, 1, dropout=0) for l in range(nlayers)]
             if wdrop:
@@ -44,7 +56,7 @@ class RNNModel(nn.Module):
             from torchqrnn import QRNNLayer
             self.rnns = [QRNNLayer(input_size=ninp if l == 0 else nhid, hidden_size=nhid if l != nlayers - 1 else (ninp if tie_weights else nhid), save_prev_x=True, 
                     zoneout=0, window=2 if l == 0 else 1, output_gate=True, binarized=binarized, ctx=ctx, 
-                    collect_stats=collect_stats, scale=self.scale) for l in range(nlayers)]
+                    collect_stats=collect_stats, no_md=no_md, scale=self.scale) for l in range(nlayers)]
             for rnn in self.rnns:
                 if binarized:
                     rnn.linear.hook_weight(candle.WeightDrop, p=wdrop)
@@ -84,9 +96,29 @@ class RNNModel(nn.Module):
         self.dropoute = dropoute
         self.tie_weights = tie_weights
 
-    def norm_prune(self, pct=0.4):
+    def norm_prune(self, drop_pct=0.4):
         for rnn in self.rnns:
-            candle.prune_qrnn(rnn.linear, 1 - math.sqrt(1 - pct))
+            candle.prune_qrnn(rnn.linear, 1 - math.sqrt(1 - drop_pct))
+
+    def norm_prune_lstm(self, drop_pct=0.4):
+        for rnn in self.rnns:
+            rnn.norm_prune(1 - math.sqrt(1 - drop_pct))
+
+    def linear_prune_lstm(self, keep_pct=1):
+        for rnn in self.rnns:
+            rnn.linear_prune(math.sqrt(keep_pct))
+
+    def linear_prune(self, keep_pct=1):
+        for i, rnn in enumerate(self.rnns):
+            if i != 0:
+                candle.linear_prune_qrnn(rnn.linear, fixed_size=fixed_size, mode="in")
+            fixed_size = candle.linear_prune_qrnn(rnn.linear, percentage=math.sqrt(keep_pct), mode="out")
+            if i == 0:
+                self.nhid = fixed_size
+            rnn.hidden_size = fixed_size
+        self.nout = fixed_size
+        self.decoder.weight = nn.Parameter(self.decoder.weight.clone().data)
+        self.decoder.weight.data = self.decoder.weight.data[:, :fixed_size]
 
     def reset(self):
         if self.rnn_type == 'QRNN': [r.reset() for r in self.rnns]
@@ -131,17 +163,21 @@ class RNNModel(nn.Module):
         result = output.view(output.size(0)*output.size(1), output.size(2))
         # if self.binarized:
         #     result = self.decode_bn(result)
-        result = self.decoder(result)
+        if not self.se:
+            result = self.decoder(result)
         if return_h:
             return result, hidden, raw_outputs, outputs
-        return result.view(output.size(0), output.size(1), result.size(1)), hidden
+        if self.se:
+            return result, hidden
+        else:
+            return result.view(output.size(0), output.size(1), result.size(1)), hidden
 
     def init_hidden(self, bsz):
         weight = next(self.parameters()).data
-        if self.rnn_type == 'LSTM':
-            return [(Variable(weight.new(1, bsz, self.nhid if l != self.nlayers - 1 else (self.ninp if self.tie_weights else self.nhid)).zero_()),
-                    Variable(weight.new(1, bsz, self.nhid if l != self.nlayers - 1 else (self.ninp if self.tie_weights else self.nhid)).zero_()))
+        if self.rnn_type == 'LSTM' or self.rnn_type == 'LSTM-MD':
+            return [(Variable(weight.new(1, bsz, self.nhid if l != self.nlayers - 1 else (self.nout if self.tie_weights else self.nhid)).zero_()),
+                    Variable(weight.new(1, bsz, self.nhid if l != self.nlayers - 1 else (self.nout if self.tie_weights else self.nhid)).zero_()))
                     for l in range(self.nlayers)]
         elif self.rnn_type == 'QRNN' or self.rnn_type == 'GRU':
-            return [Variable(weight.new(1, bsz, self.nhid if l != self.nlayers - 1 else (self.ninp if self.tie_weights else self.nhid)).zero_())
+            return [Variable(weight.new(1, bsz, self.nhid if l != self.nlayers - 1 else (self.nout if self.tie_weights else self.nhid)).zero_())
                     for l in range(self.nlayers)]

@@ -27,9 +27,14 @@ class Dictionary(object):
 class Corpus(object):
     def __init__(self, path):
         self.dictionary = Dictionary()
-        self.train = self.tokenize(os.path.join(path, 'train.txt'))
-        self.valid = self.tokenize(os.path.join(path, 'valid.txt'))
-        self.test = self.tokenize(os.path.join(path, 'test.txt'))
+        prefix = ""
+        suffix = ".txt"
+        if "wikitext-103" in path:
+            prefix = "wiki."
+            suffix = ".tokens"
+        self.train = self.tokenize(os.path.join(path, f'{prefix}train{suffix}'))
+        self.valid = self.tokenize(os.path.join(path, f'{prefix}valid{suffix}'))
+        self.test = self.tokenize(os.path.join(path, f'{prefix}test{suffix}'))
 
     def tokenize(self, path):
         """Tokenizes a text file."""

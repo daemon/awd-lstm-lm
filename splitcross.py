@@ -104,10 +104,7 @@ class SplitCrossEntropyLoss(nn.Module):
         return split_targets, split_hiddens
 
     def forward(self, decoder, hiddens, targets, verbose=False, binarized=False):
-        try:
-            weight, bias = decoder.weight_provider().reify(flat=True)
-        except:
-            weight, bias = decoder.weight, decoder.bias
+        weight, bias = decoder.weight, decoder.bias
         if self.verbose or verbose:
             for idx in sorted(self.stats):
                 print('{}: {}'.format(idx, int(np.mean(self.stats[idx]))), end=', ')
